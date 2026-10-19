@@ -132,8 +132,15 @@ def setup_sheet():
         t = book.add_worksheet(title=REF_TAB, rows=500, cols=2 + MAX_HIST)
         t.update(range_name="A1:C1", values=[["Part No.", "Field", "History (newest first)"]])
     if LOG_TAB not in titles:
-        t = book.add_worksheet(title=LOG_TAB, rows=2000, cols=6)
-        t.update(range_name="A1:F1", values=[["Time", "User", "Part No.", "Field", "Old", "New"]])
+        t = book.add_worksheet(title=LOG_TAB, rows=2000, cols=8)
+        t.update(range_name="A1:H1", values=[["Time", "User", "Part No.", "Field", "Old", "New",
+                                              "Production Line", "Machine Name"]])
+    else:
+        t = book.worksheet(LOG_TAB)
+        if len(t.row_values(1)) < 8:      # upgrade an older 6-column Log
+            if t.col_count < 8:
+                t.add_cols(8 - t.col_count)
+            t.update(range_name="G1:H1", values=[["Production Line", "Machine Name"]])
 
     # Row colouring inside the sheet (replaces any older/wrong rules of the same kind)
     meta = book.fetch_sheet_metadata({"fields": "sheets(properties.sheetId,conditionalFormats)"})
@@ -217,52 +224,70 @@ def push_history(ref, ref_vals, part, field, entry, seed):
 
 
 def save_changes(part_no, new, user):
-    """new = {'last': date|None, 'next': date|None, 'note': str, 'stock': float|None}. Returns changed field names."""
+    """new = {'last','next': date|None, 'note','line','machine': str, 'stock','freq': float|None}.
+    Returns the names of the changed fields."""
     ws, ref, log, book = main_ws(), get_tab(REF_TAB), get_tab(LOG_TAB), get_book()
     ci = col_index(ws.row_values(1))
     c = {n: ci[key(n)] for n in (COL_PART_NO, COL_LAST, COL_NEXT, COL_NOTES, COL_STOCK)}
+    c_line, c_mach, c_freq = (ci.get(key(n)) for n in (COL_LINE, COL_MACHINE, COL_FREQ))
     parts = [str(p).strip() for p in ws.col_values(c[COL_PART_NO])]
     if part_no not in parts:
         raise RuntimeError("This part no longer exists in the sheet.")
     row = parts.index(part_no) + 1
     cur = ws.row_values(row, value_render_option="UNFORMATTED_VALUE")
-    get = lambda n: cur[c[n] - 1] if c[n] - 1 < len(cur) else ""
+    getc = lambda col: (cur[col - 1] if col and col - 1 < len(cur) else "")
     now = datetime.now(TZ)
 
-    changes = []   # (field, column, value to write, history text, old value text, is_date)
+    # (field, column, value to write, history text, old value text, is_date, keep_history)
+    changes = []
     for field, new_d in ((COL_LAST, new.get("last")), (COL_NEXT, new.get("next"))):
-        old_d = to_date(get(field))
+        old_d = to_date(getc(c[field]))
         if new_d and new_d != old_d:
             s = f"{new_d:%Y-%m-%d}"
-            changes.append((field, c[field], s, s, f"{old_d:%Y-%m-%d}" if old_d else "", True))
+            changes.append((field, c[field], s, s, f"{old_d:%Y-%m-%d}" if old_d else "", True, True))
+    for field, col, val in ((COL_LINE, c_line, new.get("line")), (COL_MACHINE, c_mach, new.get("machine"))):
+        val = (val or "").strip()
+        old = str(getc(col) or "").strip()
+        if col and val and val != old:
+            changes.append((field, col, val, val, old, False, True))
     if (new.get("note") or "").strip():
         e = f"{now:%Y-%m-%d} | {new['note'].strip()}"
-        changes.append((COL_NOTES, c[COL_NOTES], e, e, str(get(COL_NOTES) or ""), False))
-    old_stock = num(get(COL_STOCK))
+        changes.append((COL_NOTES, c[COL_NOTES], e, e, str(getc(c[COL_NOTES]) or ""), False, True))
+    old_stock = num(getc(c[COL_STOCK]))
     if new.get("stock") is not None and new["stock"] != old_stock:
         changes.append((COL_STOCK, c[COL_STOCK], new["stock"], f"{new['stock']:g}",
-                        f"{old_stock:g}" if old_stock is not None else "", False))
+                        f"{old_stock:g}" if old_stock is not None else "", False, True))
+    if c_freq and new.get("freq") and getc(c_freq) in ("", None):     # frequency is set only once
+        changes.append((COL_FREQ, c_freq, new["freq"], f"{new['freq']:g}", "", False, False))
     if not changes:
         return []
+
+    # where the change was done (recorded in the Log with every change)
+    line_ctx = (new.get("line") or "").strip() or str(getc(c_line) or "")
+    mach_ctx = (new.get("machine") or "").strip() or str(getc(c_mach) or "")
 
     ref_vals = ref.get_all_values()
     ref_ups, reqs, main_ups, log_rows = [], [], [], []
     last_col = 2 + MAX_HIST
-    for field, col, write, hist, old, is_date in changes:
-        r, entries = push_history(ref, ref_vals, part_no, field, hist, old)
-        ref_ups.append({"range": f"A{r}", "values": [[part_no, field] + entries + [""] * (MAX_HIST - len(entries))]})
-        reqs.append({"setDataValidation": {"range": grid(ws.id, row, col), "rule": {
-            "condition": {"type": "ONE_OF_RANGE", "values": [
-                {"userEnteredValue": f"='{REF_TAB}'!{rowcol_to_a1(r, 3)}:{rowcol_to_a1(r, last_col)}"}]},
-            "showCustomUi": True, "strict": False}}})
+    for field, col, write, hist, old, is_date, keep_hist in changes:
         main_ups.append({"range": rowcol_to_a1(row, col), "values": [[write]]})
-        log_rows.append([f"{now:%Y-%m-%d %H:%M:%S}", user, part_no, field, old, hist])
+        log_rows.append([f"{now:%Y-%m-%d %H:%M:%S}", user, part_no, field, old, hist, line_ctx, mach_ctx])
+        if keep_hist:
+            r, entries = push_history(ref, ref_vals, part_no, field, hist, old)
+            ref_ups.append({"range": f"A{r}",
+                            "values": [[part_no, field] + entries + [""] * (MAX_HIST - len(entries))]})
+            reqs.append({"setDataValidation": {"range": grid(ws.id, row, col), "rule": {
+                "condition": {"type": "ONE_OF_RANGE", "values": [
+                    {"userEnteredValue": f"='{REF_TAB}'!{rowcol_to_a1(r, 3)}:{rowcol_to_a1(r, last_col)}"}]},
+                "showCustomUi": True, "strict": False}}})
         if is_date:
             reqs.append(date_fmt_request(ws.id, row, col))
 
-    ref.batch_update(ref_ups, value_input_option="RAW")
+    if ref_ups:
+        ref.batch_update(ref_ups, value_input_option="RAW")
     ws.batch_update(main_ups, value_input_option="USER_ENTERED")
-    book.batch_update({"requests": reqs})
+    if reqs:
+        book.batch_update({"requests": reqs})
     log.append_rows(log_rows, value_input_option="RAW")
     return [ch[0] for ch in changes]
 
@@ -289,7 +314,8 @@ def create_part(vals, user):
     if reqs:
         get_book().batch_update({"requests": reqs})
     log.append_rows([[f"{datetime.now(TZ):%Y-%m-%d %H:%M:%S}", user, pn, "NEW PART",
-                      "", vals.get(COL_NAME, "")]], value_input_option="RAW")
+                      "", vals.get(COL_NAME, ""), vals.get(COL_LINE, ""), vals.get(COL_MACHINE, "")]],
+                      value_input_option="RAW")
     return pn
 
 
@@ -351,20 +377,34 @@ def search_tab(headers, rows, user):
                              max_value=date(2100, 1, 1), key=f"last_{part_no}_{v}")
     new_next = c2.date_input("Next change", value=r["_next"], min_value=date(2000, 1, 1),
                              max_value=date(2100, 1, 1), key=f"next_{part_no}_{v}")
-    if r["_freq"] and new_last and add_freq(new_last, r["_freq"]):
-        st.caption(f"Frequency is {r['_freq']:g} month(s) → suggested next change: "
-                   f"**{add_freq(new_last, r['_freq']):%Y-%m-%d}**")
+    c3, c4 = st.columns(2)
+    new_line = c3.text_input("Production Line (where this change was done)",
+                             value=str(r.get(COL_LINE) or ""), key=f"line_{part_no}_{v}")
+    new_machine = c4.text_input("Machine Name (where this change was done)",
+                                value=str(r.get(COL_MACHINE) or ""), key=f"mach_{part_no}_{v}")
+    new_freq = None
+    if r.get(COL_FREQ) in ("", None):      # asked only while the frequency has never been recorded
+        new_freq = st.number_input("Frequency rate (months) — not recorded yet, enter it once",
+                                   min_value=0.0, step=1.0, value=None, key=f"freq_{part_no}_{v}")
+    eff_freq = r["_freq"] or new_freq
+    if eff_freq and new_last and add_freq(new_last, eff_freq):
+        st.caption(f"Frequency is {eff_freq:g} month(s) → suggested next change: "
+                   f"**{add_freq(new_last, eff_freq):%Y-%m-%d}**")
     new_note = st.text_input("Notes (new note — leave empty to keep the current one)", key=f"note_{part_no}_{v}")
     new_stock = st.number_input("Stock", min_value=0.0, step=1.0,
                                 value=r["_stock"] if r["_stock"] is not None else 0.0, key=f"stock_{part_no}_{v}")
 
     stock_changed = new_stock != (r["_stock"] if r["_stock"] is not None else 0.0)
-    changed = (new_last != r["_last"]) or (new_next != r["_next"]) or bool(new_note.strip()) or stock_changed
+    line_changed = bool(new_line.strip()) and new_line.strip() != str(r.get(COL_LINE) or "").strip()
+    mach_changed = bool(new_machine.strip()) and new_machine.strip() != str(r.get(COL_MACHINE) or "").strip()
+    changed = ((new_last != r["_last"]) or (new_next != r["_next"]) or bool(new_note.strip())
+               or stock_changed or line_changed or mach_changed or bool(new_freq))
     if st.button("💾 Save", type="primary", disabled=not changed):
         try:
-            done = save_changes(part_no, {"last": new_last, "next": new_next, "note": new_note,
-                                          "stock": new_stock if (stock_changed or r["_stock"] is not None) else None},
-                                user)
+            done = save_changes(part_no, {
+                "last": new_last, "next": new_next, "note": new_note,
+                "line": new_line, "machine": new_machine, "freq": new_freq,
+                "stock": new_stock if (stock_changed or r["_stock"] is not None) else None}, user)
         except (gspread.exceptions.APIError, RuntimeError) as e:
             st.error(f"Could not save: {e}")
             return
